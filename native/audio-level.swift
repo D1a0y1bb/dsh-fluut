@@ -198,7 +198,7 @@ timer.setEventHandler {
     state.callbackCount = 0
     os_unfair_lock_unlock(&state.lock)
     let list = out.map { String(format: "%.6f", $0) }.joined(separator: ",")
-    print("{\"ok\":true,\"bands\":[\(list)],\"cb\":\(cb)")
+    print("{\"ok\":true,\"bands\":[\(list)],\"cb\":\(cb)}")
     fflush(stdout)
 }
 timer.resume()
