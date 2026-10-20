@@ -1,0 +1,38 @@
+{
+  "name": "dsh-sidebar-tidy",
+  "version": "0.9.3",
+  "private": true,
+  "description": "DSH 界面微调：精简品牌、隐藏新会话、侧栏不透明、轨迹轨移到左侧、滚动条自动隐藏、音频琴键 / DSH shell tweaks with an audio-driven turn rail",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sidebar",
+    "ui"
+  ],
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

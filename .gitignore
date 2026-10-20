@@ -1,0 +1,5 @@
+node_modules/
+*.log
+.DS_Store
+lib/.client.new.tmp
+native/.sampler.pid
