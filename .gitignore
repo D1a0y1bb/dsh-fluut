@@ -3,3 +3,5 @@ node_modules/
 .DS_Store
 lib/.client.new.tmp
 native/.sampler.pid
+native/.sampler.err
+native/.sampler.pid

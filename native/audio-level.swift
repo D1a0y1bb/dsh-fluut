@@ -124,6 +124,19 @@ func audioIOProc(
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+    // 宿主把子进程 stderr 吞掉了，失败原因额外写进文件，方便定位。
+    let logPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".dsh/plugins/dsh-fluut/native/.sampler.err")
+    let line = "\(Date()) \(message)\n"
+    if let data = line.data(using: .utf8) {
+        if let handle = try? FileHandle(forWritingTo: logPath) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: logPath)
+        }
+    }
     print("{\"ok\":false,\"bands\":[],\"cb\":0}")
     exit(1)
 }
