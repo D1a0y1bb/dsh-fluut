@@ -5,3 +5,4 @@ lib/.client.new.tmp
 native/.sampler.pid
 native/.sampler.err
 native/.sampler.pid
+native/.host.log
