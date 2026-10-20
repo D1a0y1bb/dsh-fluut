@@ -1,8 +1,8 @@
 {
   "name": "dsh-fluut",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
-  "description": "Fluut：DSH 界面的可视微调 —— 侧边栏精简、悬停式按钮、音频琴键与对齐修正 / Visual tweaks for DeepSeek Harness: sidebar trimming, hover-only controls, audio-driven rail and alignment fixes",
+  "description": "Fluut 样式：DSH 界面的可视微调 —— 侧边栏精简、悬停式按钮、音频琴键与对齐修正 / Fluut Style: visual tweaks for DeepSeek Harness",
   "license": "MIT",
   "keywords": [
     "dsh",
