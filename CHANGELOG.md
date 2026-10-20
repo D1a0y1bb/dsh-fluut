@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 — 音频采样器改用 CoreAudio process tap
+
+不再使用 ScreenCaptureKit，因此**不再触发 macOS 的录屏/共享提示**（菜单栏那个图标）。
+
+- 采样器改为 CoreAudio 的 process tap + 私有聚合设备
+- 频段能量改为 RMS + 分贝映射，1024 点 FFT，7 段分布更均匀
+- 协议不变：仍按 50ms 输出 `{"ok":true,"bands":[...],"cb":N}`
+- 宿主侧的锁、看门狗、重启逻辑保持不变
+
 ## 1.0.0 — 重命名为 Fluut
 
 插件从 `dsh-sidebar-tidy` 改名为 `dsh-fluut`，显示名统一为 **Fluut**。

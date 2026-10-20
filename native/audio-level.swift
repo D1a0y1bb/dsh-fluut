@@ -1,156 +1,193 @@
-// dsh-audio-level — 系统音频频谱采样器
+// Fluut 音频采样器（CoreAudio process tap）
 //
-// 用 ScreenCaptureKit 抓系统输出音频，算 7 段能量，每 50ms 往 stdout 打一行 JSON：
-//   {"ok":true,"bands":[0.1,...,0.9]}
+// 用 CoreAudio 的 process tap 抓系统输出音频，算 7 段能量，每 50ms 打一行 JSON：
+//   {"ok":true,"bands":[...],"cb":N}
+// cb 是自上次输出以来收到的音频回调次数。
 //
-// 权限被拒时打 {"ok":false,"reason":"permission"}，由宿主侧决定怎么提示。
+// 与 ScreenCaptureKit 版本相比：只采音频，不触发系统录屏/共享提示。
+
 import Foundation
-import ScreenCaptureKit
-import AVFoundation
+import CoreAudio
+import AudioToolbox
 import Accelerate
 
-let BAND_COUNT = 7
-let FLOOR_HZ: Float = 60
-let CEIL_HZ: Float = 12000
-let EMIT_INTERVAL: Double = 0.05
+let bandCount = 7
+let fftLog2: vDSP_Length = 10
+let fftSize = 1 << Int(fftLog2)
+let fftHalf = fftSize / 2
 
-/// 每帧音频回调里累加的能量；主循环按固定节奏取走并清零。
-final class Spectrum: NSObject, SCStreamOutput, @unchecked Sendable {
-    private let lock = NSLock()
-    private var pending = [Float](repeating: 0, count: BAND_COUNT)
-    private var callbacks = 0
-    private var sampleRate: Float = 44100
-    private let bandEdges: [Float]
+final class LevelState {
+    let fftSetup: FFTSetup
+    var window: [Float]
+    var real: [Float]
+    var imag: [Float]
+    var samples: [Float]
+    var magnitudes: [Float]
+    var smoothed: [Float]
+    var pending: [Float]
+    var bands: [Float]
+    var callbackCount: Int = 1
+    var sampleRate: Double = 48000
+    var lock = os_unfair_lock_s()
 
-    override init() {
-        // 对数分布的频段边界，人耳分辨率更均匀
-        var edges: [Float] = []
-        let logFloor = log2(FLOOR_HZ)
-        let logCeil = log2(CEIL_HZ)
-        for i in 0...BAND_COUNT {
-            let t = Float(i) / Float(BAND_COUNT)
-            edges.append(pow(2, logFloor + (logCeil - logFloor) * t))
+    init() {
+        fftSetup = vDSP_create_fftsetup(fftLog2, FFTRadix(kFFTRadix2))!
+        window = [Float](repeating: 0, count: fftSize)
+        window.withUnsafeMutableBufferPointer { buffer in
+            vDSP_hann_window(buffer.baseAddress!, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
         }
-        bandEdges = edges
-        super.init()
+        real = [Float](repeating: 0, count: fftHalf)
+        imag = [Float](repeating: 0, count: fftHalf)
+        samples = [Float](repeating: 0, count: fftSize)
+        magnitudes = [Float](repeating: 0, count: fftHalf)
+        smoothed = [Float](repeating: 0, count: bandCount)
+        pending = [Float](repeating: 0, count: bandCount)
+        bands = [Float](repeating: 0, count: bandCount)
     }
 
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio, sampleBuffer.isValid else { return }
-        lock.lock(); callbacks += 1; lock.unlock()
-        guard let format = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else { return }
-        sampleRate = Float(asbd.mSampleRate)
-        guard asbd.mFormatID == kAudioFormatLinearPCM else { return }
-
-        // ScreenCaptureKit hands audio over as one interleaved Float32 block.
-        // Reading it through CMBlockBuffer avoids the AudioBufferList sizing
-        // dance (a stack ABL is too small for non-interleaved plans).
-        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-        var length = 0
-        var pointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(
-            dataBuffer, atOffset: 0, lengthAtOffsetOut: nil,
-            totalLengthOut: &length, dataPointerOut: &pointer)
-        guard status == noErr, let raw = pointer else { return }
-        let channels = max(1, Int(asbd.mChannelsPerFrame))
-        let floats = length / MemoryLayout<Float>.size
-        let frames = floats / channels
-        guard frames > 64 else { return }
-        let samples = UnsafeRawPointer(raw).assumingMemoryBound(to: Float.self)
-        accumulate(samples: samples, count: frames)
+    deinit {
+        vDSP_destroy_fftsetup(fftSetup)
     }
 
-    /// 用自相关式的带能量估计：对每个频段做 Goertzel，省掉整段 FFT 的开销。
-    private func accumulate(samples: UnsafePointer<Float>, count: Int) {
-        let n = min(count, 2048)
-        var local = [Float](repeating: 0, count: BAND_COUNT)
-        for band in 0..<BAND_COUNT {
-            let lo = bandEdges[band]
-            let hi = bandEdges[band + 1]
-            // 每段取 3 个探针频率，取最大响应，避免窄带信号漏检
-            var best: Float = 0
-            for probe in 0..<3 {
-                let freq = lo + (hi - lo) * (Float(probe) + 0.5) / 3.0
-                let omega = 2 * Float.pi * freq / sampleRate
-                let coeff = 2 * cos(omega)
-                var s0: Float = 0, s1: Float = 0, s2: Float = 0
-                for i in 0..<n {
-                    s0 = samples[i] + coeff * s1 - s2
-                    s2 = s1
-                    s1 = s0
+    /// 把一块交织浮点样本算成 7 个对数频段的能量并平滑。
+    func ingest(_ input: UnsafePointer<Float>, frames: Int) {
+        let take = min(frames, fftSize)
+        samples.withUnsafeMutableBufferPointer { sb in
+            for i in 0..<take { sb[i] = input[i] }
+            for i in take..<fftSize { sb[i] = 0 }
+        }
+        vDSP_vmul(samples, 1, window, 1, &samples, 1, vDSP_Length(fftSize))
+
+        real.withUnsafeMutableBufferPointer { rb in
+            imag.withUnsafeMutableBufferPointer { ib in
+                var split = DSPSplitComplex(realp: rb.baseAddress!, imagp: ib.baseAddress!)
+                samples.withUnsafeBufferPointer { sb in
+                    sb.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: fftHalf) { cp in
+                        vDSP_ctoz(cp, 2, &split, 1, vDSP_Length(fftHalf))
+                    }
                 }
-                let power = s1 * s1 + s2 * s2 - coeff * s1 * s2
-                best = max(best, power)
+                vDSP_fft_zrip(fftSetup, &split, 1, fftLog2, FFTDirection(FFT_FORWARD))
+                vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(fftHalf))
             }
-            // 归一化到 0..1：先开方压掉动态范围，再轻度放大，避免低段长期顶满。
-            let magnitude = sqrt(max(0, best)) / Float(n)
-            local[band] = min(1, powf(magnitude * 9, 0.55))
         }
-        lock.lock()
-        for i in 0..<BAND_COUNT { pending[i] = max(pending[i] * 0.75, local[i]) }
-        lock.unlock()
-    }
 
-    /// How many audio buffers arrived since the previous call. Zero means the
-    /// stream is alive but stalled, which the host uses as a restart signal.
-    func takeCallbackDelta() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        let value = callbacks
-        callbacks = 0
-        return value
-    }
+        let nyquist = sampleRate / 2
+        let lowF = 60.0
+        let highF = min(12000.0, nyquist * 0.95)
+        let norm = 1.0 / Float(fftSize)
+        for b in 0..<bandCount {
+            let f0 = lowF * pow(highF / lowF, Double(b) / Double(bandCount))
+            let f1 = lowF * pow(highF / lowF, Double(b + 1) / Double(bandCount))
+            let i0 = max(1, min(fftHalf - 1, Int(f0 / nyquist * Double(fftHalf))))
+            let i1 = max(i0 + 1, min(fftHalf, Int(f1 / nyquist * Double(fftHalf))))
+            var energy: Float = 0
+            for i in i0..<i1 {
+                let v = magnitudes[i] * norm
+                energy += v * v
+            }
+            let rms = sqrt(energy / Float(i1 - i0))
+            // 20*log10 后映射到 0..1：-70dB 以下算静音，-15dB 以上算满。
+            let db = 20 * log10(max(rms, 1e-7))
+            pending[b] = min(1, max(0, (db + 70) / 55))
+        }
 
-    func take() -> [Float] {
-        lock.lock()
-        defer { lock.unlock() }
-        let out = pending.map { min(1, $0) }
-        for i in 0..<BAND_COUNT { pending[i] *= 0.5 }
-        return out
+        os_unfair_lock_lock(&lock)
+        for b in 0..<bandCount {
+            smoothed[b] = max(pending[b] * 0.75, smoothed[b] * 0.85)
+            bands[b] = smoothed[b]
+        }
+        callbackCount += 1
+        os_unfair_lock_unlock(&lock)
     }
 }
 
-func emit(_ object: [String: Any]) {
-    guard let data = try? JSONSerialization.data(withJSONObject: object),
-          var line = String(data: data, encoding: .utf8) else { return }
-    line += "\n"
-    FileHandle.standardOutput.write(line.data(using: .utf8)!)
+let state = LevelState()
+
+/// C 回调：CoreAudio 把音频块交到这里。
+func audioIOProc(
+    _ device: AudioObjectID,
+    _ now: UnsafePointer<AudioTimeStamp>,
+    _ inputData: UnsafePointer<AudioBufferList>,
+    _ inputTime: UnsafePointer<AudioTimeStamp>,
+    _ outputData: UnsafeMutablePointer<AudioBufferList>,
+    _ outputTime: UnsafePointer<AudioTimeStamp>,
+    _ clientData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+    guard list.count > 0,
+          let raw = list[0].mData,
+          list[0].mDataByteSize > 0 else { return noErr }
+    let frames = Int(list[0].mDataByteSize) / MemoryLayout<Float>.size
+    state.ingest(raw.assumingMemoryBound(to: Float.self), frames: frames)
+    return noErr
 }
 
-let spectrum = Spectrum()
-
-Task {
-    do {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else {
-            emit(["ok": false, "reason": "no-display"])
-            exit(2)
-        }
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        config.sampleRate = 44100
-        config.channelCount = 2
-        // 视频流是 SCStream 的必需品，压到最小成本
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-        try stream.addStreamOutput(spectrum, type: .audio, sampleHandlerQueue: DispatchQueue(label: "audio", qos: .userInteractive))
-        try await stream.startCapture()
-        emit(["ok": true, "bands": [Float](repeating: 0, count: BAND_COUNT)])
-
-        while true {
-            try? await Task.sleep(nanoseconds: UInt64(EMIT_INTERVAL * 1_000_000_000))
-            emit(["ok": true, "bands": spectrum.take(), "cb": spectrum.takeCallbackDelta()])
-        }
-    } catch {
-        emit(["ok": false, "reason": "capture", "detail": String(describing: error)])
-        exit(3)
-    }
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+    print("{\"ok\":false,\"bands\":[],\"cb\":0}")
+    exit(1)
 }
+
+func propAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+}
+
+// 1. 全局立体声 tap
+let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+description.uuid = UUID()
+description.name = "Fluut Audio Tap"
+description.isPrivate = true
+description.muteBehavior = .unmuted
+
+var tapID = AudioObjectID(kAudioObjectUnknown)
+var status = AudioHardwareCreateProcessTap(description, &tapID)
+if status != noErr { fail("create tap failed: \(status)") }
+
+// 2. tap 装进私有聚合设备
+let aggregate: [String: Any] = [
+    kAudioAggregateDeviceNameKey as String: "Fluut Tap Device",
+    kAudioAggregateDeviceUIDKey as String: UUID().uuidString,
+    kAudioAggregateDeviceIsPrivateKey as String: true,
+    kAudioAggregateDeviceTapListKey as String: [
+        [
+            kAudioSubTapUIDKey as String: description.uuid.uuidString,
+            kAudioSubTapDriftCompensationKey as String: true
+        ]
+    ]
+]
+
+var deviceID = AudioObjectID(kAudioObjectUnknown)
+status = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &deviceID)
+if status != noErr { fail("create aggregate failed: \(status)") }
+
+// 3. 读 tap 的采样率
+var fmtAddr = propAddress(kAudioTapPropertyFormat)
+var asbd = AudioStreamBasicDescription()
+var fmtSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+if AudioObjectGetPropertyData(tapID, &fmtAddr, 0, nil, &fmtSize, &asbd) == noErr, asbd.mSampleRate > 0 {
+    state.sampleRate = asbd.mSampleRate
+}
+
+// 4. 启动 IOProc
+var procID: AudioDeviceIOProcID?
+status = AudioDeviceCreateIOProcID(deviceID, audioIOProc, nil, &procID)
+if status != noErr { fail("create ioproc failed: \(status)") }
+status = AudioDeviceStart(deviceID, procID)
+if status != noErr { fail("start failed: \(status)") }
+
+// 5. 每 50ms 输出一行
+let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+timer.schedule(deadline: .now(), repeating: 0.05)
+timer.setEventHandler {
+    os_unfair_lock_lock(&state.lock)
+    let out = state.bands
+    let cb = state.callbackCount
+    state.callbackCount = 0
+    os_unfair_lock_unlock(&state.lock)
+    let list = out.map { String(format: "%.6f", $0) }.joined(separator: ",")
+    print("{\"ok\":true,\"bands\":[\(list)],\"cb\":\(cb)")
+    fflush(stdout)
+}
+timer.resume()
 
 RunLoop.main.run()
