@@ -1,15 +1,17 @@
 {
-  "name": "dsh-sidebar-tidy",
-  "version": "0.9.3",
+  "name": "dsh-fluut",
+  "version": "1.0.0",
   "private": true,
-  "description": "DSH 界面微调：精简品牌、隐藏新会话、侧栏不透明、轨迹轨移到左侧、滚动条自动隐藏、音频琴键 / DSH shell tweaks with an audio-driven turn rail",
+  "description": "Fluut：DSH 界面的可视微调 —— 侧边栏精简、悬停式按钮、音频琴键与对齐修正 / Visual tweaks for DeepSeek Harness: sidebar trimming, hover-only controls, audio-driven rail and alignment fixes",
   "license": "MIT",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
+    "fluut",
+    "ui",
     "sidebar",
-    "ui"
+    "tweaks"
   ],
   "type": "module",
   "main": "./lib/index.js",
@@ -19,10 +21,12 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/index.js",
-    "lib/client.js",
+    "lib",
+    "native",
     "cordis.patch.yml",
-    "README.md"
+    "icon.svg",
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=22"
@@ -34,5 +38,15 @@
     "client": {
       "platform": "web"
     }
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/D1a0y1bb/dsh-fluut.git"
+  },
+  "homepage": "https://github.com/D1a0y1bb/dsh-fluut#readme",
+  "bugs": {
+    "url": "https://github.com/D1a0y1bb/dsh-fluut/issues"
+  },
+  "author": "D1a0y1bb",
+  "icon": "./icon.svg"
 }

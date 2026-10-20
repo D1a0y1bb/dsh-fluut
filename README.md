@@ -1,4 +1,4 @@
-# dsh-sidebar-tidy
+# Fluut
 
 DSH 界面微调。五个开关，全部是纯视觉，随时可以还原：
 
